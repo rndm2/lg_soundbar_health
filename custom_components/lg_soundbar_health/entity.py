@@ -135,6 +135,13 @@ class LGSoundbarHealthEntity(CoordinatorEntity[LGSoundbarHealthCoordinator]):
             "initial_ip_failure_count": state.initial_ip_failure_count,
             "auto_reload_enabled": state.auto_reload_enabled,
             "auto_reload_ready": state.auto_reload_ready,
+            "auto_reload_reason": state.auto_reload_reason,
+            "parent_connected": state.parent_connected,
+            "parent_failure_count": state.parent_failure_count,
+            "parent_last_success": (
+                state.parent_last_success.isoformat() if state.parent_last_success else None
+            ),
+            "parent_last_error": ha_safe_text(state.parent_last_error),
             "last_parent_reload": (
                 state.last_parent_reload.isoformat() if state.last_parent_reload else None
             ),
