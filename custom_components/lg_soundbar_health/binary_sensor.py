@@ -25,7 +25,6 @@ class HealthBinarySensorKey(StrEnum):
     """Health binary sensor keys."""
 
     CONNECTION = "connection"
-    PARENT_CONNECTION = "parent_connection"
     INITIAL_IP_CONNECTION = "initial_ip_connection"
     IP_CHANGED = "ip_changed"
 
@@ -38,13 +37,6 @@ class HealthBinarySensorDescription(BinarySensorEntityDescription):
 
 
 BINARY_SENSOR_DESCRIPTIONS: tuple[HealthBinarySensorDescription, ...] = (
-    HealthBinarySensorDescription(
-        key=HealthBinarySensorKey.PARENT_CONNECTION,
-        name="Integration connection",
-        icon="mdi:lan-connect",
-        device_class=BinarySensorDeviceClass.CONNECTIVITY,
-        value_fn=lambda state: state.parent_connected,
-    ),
     HealthBinarySensorDescription(
         key=HealthBinarySensorKey.CONNECTION,
         name="Connection",
