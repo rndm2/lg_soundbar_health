@@ -16,6 +16,10 @@ from homeassistant.const import CONF_HOST, CONF_NAME, CONF_PORT, Platform
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from homeassistant.helpers.storage import Store
+from homeassistant.helpers import entity_registry as er
+from homeassistant.helpers.entity_component import DATA_INSTANCES
+
+from .parent_connection import ParentConnectionProbe
 
 from .const import (
     DATA_COORDINATOR,
@@ -129,6 +133,10 @@ class HealthState:
     parent_reload_last_error: str | None = None
     parent_reload_in_progress: bool = False
     parent_reload_last_reason: str | None = None
+    parent_connected: bool | None = None
+    parent_failure_count: int = 0
+    parent_last_success: datetime | None = None
+    parent_last_error: str | None = None
 
     @property
     def offline_duration_seconds(self) -> int:
@@ -149,12 +157,23 @@ class HealthState:
         """Return whether the current state satisfies the auto-reload condition."""
         return (
             self.auto_reload_enabled
-            and self.ip_changed is True
             and self.connected is True
-            and self.initial_ip_connected is False
-            and self.initial_ip_failure_count >= DEFAULT_AUTO_RELOAD_INITIAL_FAILURES
+            and self.auto_reload_reason is not None
             and not self.parent_reload_in_progress
         )
+
+    @property
+    def auto_reload_reason(self) -> str | None:
+        """Identify a confirmed failure independently of the device power state."""
+        if (
+            self.ip_changed is True
+            and self.initial_ip_connected is False
+            and self.initial_ip_failure_count >= DEFAULT_AUTO_RELOAD_INITIAL_FAILURES
+        ):
+            return "auto_ip_changed"
+        if self.parent_connected is False and self.parent_failure_count >= 3:
+            return "auto_parent_unresponsive"
+        return None
 
 
 class LGSoundbarHealthCoordinator(DataUpdateCoordinator[dict[str, HealthState]]):
@@ -178,6 +197,7 @@ class LGSoundbarHealthCoordinator(DataUpdateCoordinator[dict[str, HealthState]])
         self._parent_reload_tasks: set[asyncio.Task[Any]] = set()
         self._store: Store[dict[str, Any]] = Store(hass, STORAGE_VERSION, STORAGE_KEY)
         self._parent_reload_history: dict[str, dict[str, Any]] = {}
+        self._parent_probes: dict[str, ParentConnectionProbe] = {}
 
     @property
     def auto_reload_enabled(self) -> bool:
@@ -252,6 +272,10 @@ class LGSoundbarHealthCoordinator(DataUpdateCoordinator[dict[str, HealthState]])
 
         @callback
         def _source_state_changed(*_: Any) -> None:
+            self._close_parent_probe(source_entry.entry_id)
+            if state := self._states.get(source_entry.entry_id):
+                state.parent_connected = None
+                state.parent_failure_count = 0
             if source_entry.state is ConfigEntryState.LOADED:
                 _LOGGER.debug(
                     "LG Soundbar source entry %s loaded; refreshing initial IP snapshot",
@@ -271,6 +295,7 @@ class LGSoundbarHealthCoordinator(DataUpdateCoordinator[dict[str, HealthState]])
         current_ids = {target.source_entry_id for target in targets}
 
         for stale_id in set(self._states) - current_ids:
+            self._close_parent_probe(stale_id)
             self._states.pop(stale_id, None)
             self._initial_endpoints.pop(stale_id, None)
             self._parent_reload_history.pop(stale_id, None)
@@ -313,6 +338,8 @@ class LGSoundbarHealthCoordinator(DataUpdateCoordinator[dict[str, HealthState]])
             state.failure_count = 0
             state.offline_since = None
 
+        await self._check_parent_connection(state)
+
         initial_endpoint = await self._async_get_initial_endpoint(target, current_endpoint, checked_at)
         state.initial_ip = initial_endpoint.ip_address
         state.initial_ip_captured_at = initial_endpoint.captured_at
@@ -344,6 +371,77 @@ class LGSoundbarHealthCoordinator(DataUpdateCoordinator[dict[str, HealthState]])
             state.initial_ip_failure_count = 0
 
         self._maybe_schedule_auto_reload(state)
+
+    def _close_parent_probe(self, source_entry_id: str) -> None:
+        if probe := self._parent_probes.pop(source_entry_id, None):
+            probe.close()
+
+    async def _check_parent_connection(self, state: HealthState) -> None:
+        """Require a response through the actual LG media-player connection."""
+        entry_id = state.target.source_entry_id
+        source_entry = self._get_source_entry(entry_id)
+        state.parent_connected = None
+        state.parent_last_error = None
+        if (
+            not state.connected
+            or source_entry is None
+            or source_entry.state is not ConfigEntryState.LOADED
+            or state.parent_reload_in_progress
+        ):
+            state.parent_failure_count = 0
+            return
+
+        component = self.hass.data.get(DATA_INSTANCES, {}).get("media_player")
+        registry = er.async_get(self.hass)
+        devices = []
+        if component is not None:
+            for registered in er.async_entries_for_config_entry(registry, entry_id):
+                if registered.domain != "media_player" or registered.disabled_by:
+                    continue
+                entity = component.get_entity(registered.entity_id)
+                device = getattr(entity, "_device", None)
+                if device is not None:
+                    devices.append(device)
+
+        if len(devices) != 1 or not ParentConnectionProbe.supported(devices[0]):
+            self._close_parent_probe(entry_id)
+            state.parent_failure_count = 0
+            state.parent_last_error = "Native LG connection unavailable or unsupported; heartbeat recovery skipped"
+            return
+
+        device = devices[0]
+        probe = self._parent_probes.get(entry_id)
+        if probe is None or probe.device is not device:
+            self._close_parent_probe(entry_id)
+            probe = self._parent_probes[entry_id] = ParentConnectionProbe(device)
+            state.parent_failure_count = 0
+
+        try:
+            connected, error = await probe.check()
+        except Exception as err:  # Unknown adapter errors must never trigger reload loops.
+            self._close_parent_probe(entry_id)
+            state.parent_failure_count = 0
+            state.parent_last_error = ha_safe_text(str(err), fallback=type(err).__name__)
+            _LOGGER.warning("Native LG heartbeat adapter failed for %s: %s", state.target.name, err)
+            return
+        # A user reload may have replaced the connection while we awaited it.
+        if self._parent_probes.get(entry_id) is not probe:
+            state.parent_failure_count = 0
+            return
+        state.parent_connected = connected
+        state.parent_last_error = error
+        if connected:
+            if state.parent_failure_count:
+                _LOGGER.info("Native LG connection recovered for %s", state.target.name)
+            state.parent_failure_count = 0
+            state.parent_last_success = datetime.now(UTC)
+        else:
+            state.parent_failure_count += 1
+            if state.parent_failure_count in (1, 3):
+                _LOGGER.warning(
+                    "Native LG heartbeat failed for %s (%s consecutive checks): %s",
+                    state.target.name, state.parent_failure_count, error,
+                )
 
     async def _async_get_initial_endpoint(
         self,
@@ -429,6 +527,7 @@ class LGSoundbarHealthCoordinator(DataUpdateCoordinator[dict[str, HealthState]])
             return
 
         state.parent_reload_in_progress = True
+        _LOGGER.warning("Reloading LG Soundbar %s: %s", state.target.name, reason)
         state.parent_reload_last_reason = ha_safe_text(reason, fallback="unknown") or "unknown"
         state.parent_reload_last_error = None
         state.last_parent_reload = datetime.now(UTC)
@@ -529,7 +628,7 @@ class LGSoundbarHealthCoordinator(DataUpdateCoordinator[dict[str, HealthState]])
                 return
 
         task = self.hass.async_create_task(
-            self.async_reload_parent(state.target.source_entry_id, reason="auto_ip_changed")
+            self.async_reload_parent(state.target.source_entry_id, reason=state.auto_reload_reason)
         )
         self._parent_reload_tasks.add(task)
         task.add_done_callback(self._parent_reload_tasks.discard)
@@ -593,6 +692,8 @@ class LGSoundbarHealthCoordinator(DataUpdateCoordinator[dict[str, HealthState]])
 
     def async_shutdown(self) -> None:
         """Unsubscribe from source entry listeners."""
+        for entry_id in list(self._parent_probes):
+            self._close_parent_probe(entry_id)
         for unsub in self._source_state_unsub.values():
             unsub()
         self._source_state_unsub.clear()
